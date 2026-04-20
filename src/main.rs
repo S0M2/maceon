@@ -13,10 +13,12 @@ use sysinfo::{Components, Disks, Networks, System};
 mod network;
 mod process;
 mod power;
+mod disk_analyzer;
 
 use network::NetworkMonitor;
 use process::ProcessMonitor;
 use power::PowerMonitor;
+use disk_analyzer::DiskAnalyzer;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const HISTORY_LEN: usize = 60;
@@ -85,6 +87,10 @@ struct App {
     net_monitor: NetworkMonitor,
     proc_monitor: ProcessMonitor,
     power_monitor: PowerMonitor,
+    disk_analyzer: DiskAnalyzer,
+
+    // Storage navigation state
+    storage_sel: usize,
 
     // Rate limiting for expensive operations
     last_network_scan: Instant,
@@ -122,6 +128,11 @@ impl App {
             net_monitor: NetworkMonitor::new(),
             proc_monitor: ProcessMonitor::new(),
             power_monitor: PowerMonitor::new(),
+            disk_analyzer: {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
+                DiskAnalyzer::new(&home)
+            },
+            storage_sel: 0,
             last_network_scan: past,
             last_process_scan: past,
             last_battery_scan: past,
@@ -462,14 +473,22 @@ fn main() -> io::Result<()> {
                     KeyCode::Down if app.tab == Tab::Storage => {
                         app.storage_off = app.storage_off.saturating_add(1);
                     }
+                    // ── Storage navigation (folder selection)
+                    KeyCode::Down if app.tab == Tab::Storage => {
+                        if app.storage_sel + 1 < app.disk_analyzer.folders.len() {
+                            app.storage_sel += 1;
+                        }
+                    }
                     KeyCode::Up if app.tab == Tab::Storage => {
-                        app.storage_off = app.storage_off.saturating_sub(1);
+                        app.storage_sel = app.storage_sel.saturating_sub(1);
                     }
-                    KeyCode::PageDown if app.tab == Tab::Storage => {
-                        app.storage_off = app.storage_off.saturating_add(10);
+                    KeyCode::Enter if app.tab == Tab::Storage => {
+                        app.disk_analyzer.enter_folder(app.storage_sel);
+                        app.storage_sel = 0;  // Reset selection when entering folder
                     }
-                    KeyCode::PageUp if app.tab == Tab::Storage => {
-                        app.storage_off = app.storage_off.saturating_sub(10);
+                    KeyCode::Backspace if app.tab == Tab::Storage => {
+                        app.disk_analyzer.go_back();
+                        app.storage_sel = 0;
                     }
                     // ── Manual scan (Connections tab)
                     KeyCode::Char('s') | KeyCode::Char('S') if app.tab == Tab::Connections => {
@@ -606,7 +625,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "[↑↓] Naviguer   [K] Tuer   [C] CPU   [M] Mém   [P] PID   [N] Nom   [Q] Quitter"
         }
         Tab::Connections => "[TAB] Changer   [↑↓] Scroller   [S] Scanner   [Q] Quitter",
-        Tab::Storage => "[TAB] Changer   [↑↓] Scroller   [C] Nettoyer tmp   [Q] Quitter",
+        Tab::Storage => "[TAB] Changer   [↑↓] Sélectionner   [Enter] Ouvrir   [BS] Retour   [C] Nettoyer tmp   [Q] Quitter",
     };
     f.render_widget(
         Paragraph::new(hint)
@@ -1069,40 +1088,62 @@ fn draw_connections(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
+// ─── Storage (Hierarchical Folder Analysis) ──────────────────────────────────
 fn draw_storage(f: &mut Frame, app: &App, area: Rect) {
-    let [table_area, gauges_area] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length((app.disks.iter().count() as u16).min(6) * 3 + 2),
-    ])
-    .areas(area);
+    let [path_area, table_area] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)])
+        .areas(area);
 
-    // Table
+    // Current path display
+    let current_path = app.disk_analyzer.current_path_str();
+    f.render_widget(
+        Paragraph::new(current_path)
+            .block(
+                Block::bordered()
+                    .title(" [ CHEMIN ] ")
+                    .border_style(Style::default().fg(CYAN)),
+            )
+            .style(Style::default().fg(LIME)),
+        path_area,
+    );
+
+    // Folder list with sizes
+    let total_size = app.disk_analyzer.total_size();
     let rows: Vec<Row> = app
-        .disks
+        .disk_analyzer
+        .folders
         .iter()
-        .map(|d| {
-            let total = d.total_space();
-            let avail = d.available_space();
-            let used = total.saturating_sub(avail);
-            let pct = if total > 0 {
-                used as f64 / total as f64 * 100.0
+        .enumerate()
+        .map(|(i, folder)| {
+            let is_selected = i == app.storage_sel;
+            let pct = disk_analyzer::calc_percentage(folder.size, total_size);
+            let size_color = if folder.size > 10 * 1024 * 1024 * 1024 {
+                RED  // > 10GB
+            } else if folder.size > 1024 * 1024 * 1024 {
+                ORANGE  // > 1GB
             } else {
-                0.0
+                LIME  // < 1GB
             };
-            let col = grade_color(pct);
+
+            let bar_width = ((pct / 100.0) * 20.0) as usize;
+            let bar = "█".repeat(bar_width) + &" ".repeat(20 - bar_width);
+
+            let style = if is_selected {
+                Style::default().bg(Color::Rgb(30, 50, 70)).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
 
             Row::new([
-                Cell::from(d.mount_point().to_string_lossy().to_string())
-                    .style(Style::default().fg(LIME)),
-                Cell::from(d.name().to_string_lossy().to_string())
-                    .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(d.file_system().to_string_lossy().to_string())
-                    .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(fmt_bytes(total)),
-                Cell::from(fmt_bytes(used)).style(Style::default().fg(col)),
-                Cell::from(fmt_bytes(avail)).style(Style::default().fg(LIME)),
+                Cell::from(format!("[{}]", if is_selected { "→" } else { " " }))
+                    .style(style.fg(CYAN)),
+                Cell::from(folder.name.clone())
+                    .style(style.fg(LIME)),
+                Cell::from(format!("[{}]", bar))
+                    .style(style.fg(size_color)),
+                Cell::from(disk_analyzer::format_bytes(folder.size))
+                    .style(style.fg(size_color).add_modifier(Modifier::BOLD)),
                 Cell::from(format!("{:.1}%", pct))
-                    .style(Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                    .style(style.fg(size_color)),
             ])
         })
         .collect();
@@ -1111,77 +1152,32 @@ fn draw_storage(f: &mut Frame, app: &App, area: Rect) {
         Table::new(
             rows,
             [
-                Constraint::Length(14),
-                Constraint::Min(18),
-                Constraint::Length(8),
-                Constraint::Length(12),
-                Constraint::Length(12),
+                Constraint::Length(3),
+                Constraint::Min(20),
+                Constraint::Length(22),
                 Constraint::Length(12),
                 Constraint::Length(8),
             ],
         )
         .header(
-            Row::new([
-                "Montage",
-                "Périphérique",
-                "FS",
-                "Total",
-                "Utilisé",
-                "Libre",
-                "Usage",
-            ])
-            .style(
-                Style::default()
-                    .fg(LIME)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ),
+            Row::new(["", "Dossier", "Usage", "Taille", "%"])
+                .style(
+                    Style::default()
+                        .fg(LIME)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
         )
         .block(
             Block::bordered()
-                .title(" [ VOLUMES DE STOCKAGE ] ")
-                .border_style(Style::default().fg(LIME)),
+                .title(format!(
+                    " [ ANALYSE HIÉRARCHIQUE ] Total: {} ",
+                    disk_analyzer::format_bytes(total_size)
+                ))
+                .border_style(Style::default().fg(if total_size > 500 * 1024 * 1024 * 1024 { RED } else { LIME })),
         )
         .column_spacing(1),
         table_area,
     );
-
-    // Gauges per disk
-    let disk_vec: Vec<_> = app.disks.iter().collect();
-    if !disk_vec.is_empty() {
-        let n = disk_vec.len().min(6);
-        let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Length(3)).collect();
-        let gauge_slots = Layout::vertical(constraints).split(gauges_area);
-
-        for (i, d) in disk_vec.iter().take(n).enumerate() {
-            let total = d.total_space();
-            let used = total.saturating_sub(d.available_space());
-            let pct = if total > 0 {
-                (used as f64 / total as f64 * 100.0) as u16
-            } else {
-                0
-            };
-            let col = grade_color(pct as f64);
-            let label = d.mount_point().to_string_lossy().to_string();
-
-            f.render_widget(
-                Gauge::default()
-                    .block(
-                        Block::bordered()
-                            .title(format!(
-                                " {} — {} / {} ",
-                                label,
-                                fmt_bytes(used),
-                                fmt_bytes(total)
-                            ))
-                            .border_style(Style::default().fg(col)),
-                    )
-                    .gauge_style(Style::default().fg(col).bg(DARK))
-                    .percent(pct)
-                    .label(format!("{pct}%")),
-                gauge_slots[i],
-            );
-        }
-    }
 }
 
 // ─── Security Threats (Network Exfiltration Detection) ────────────────────────
