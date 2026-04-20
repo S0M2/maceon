@@ -1128,11 +1128,11 @@ fn draw_storage(f: &mut Frame, app: &App, area: Rect) {
             let is_selected = i == app.storage_sel;
             let pct = disk_analyzer::calc_percentage(item.size, total_size);
             
-            // Color by type/size
-            let (type_icon, type_color) = if item.is_dir {
-                ("📁", CYAN)
+            // Color by type: Folders are CYAN, Files are LIME
+            let name_color = if item.is_dir {
+                CYAN  // Folders
             } else {
-                ("📄", LIME)
+                LIME  // Files
             };
             
             let size_color = if item.size > 10 * 1024 * 1024 * 1024 {
@@ -1157,8 +1157,8 @@ fn draw_storage(f: &mut Frame, app: &App, area: Rect) {
             Row::new([
                 Cell::from(format!("[{}]", if is_selected { "→" } else { " " }))
                     .style(style.fg(CYAN)),
-                Cell::from(format!("{} {}", type_icon, item.name))
-                    .style(style.fg(type_color)),
+                Cell::from(item.name.clone())
+                    .style(style.fg(name_color)),
                 Cell::from(format!("[{}]", bar))
                     .style(style.fg(size_color)),
                 Cell::from(disk_analyzer::format_bytes(item.size))
