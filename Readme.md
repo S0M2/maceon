@@ -1,7 +1,3 @@
-Voici un `README.md` complet, structuré et stylisé pour ton projet **System Monitor & RAM Optimizer**. Il met en avant les fonctionnalités avancées que tu as codées (onglets, gestion des processus, alertes).
-
------
-
 # System Monitor & RAM Optimizer
 
 [](https://www.rust-lang.org/)
