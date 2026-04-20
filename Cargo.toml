@@ -1,5 +1,5 @@
 [package]
-name = "TOOLS"
+name = "maceon"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,3 +7,14 @@ edition = "2024"
 crossterm = "0.29.0"
 ratatui = "0.30.0"
 sysinfo = "0.38.4"
+
+# Network monitoring
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+log = "0.4"
+regex = "1.10"

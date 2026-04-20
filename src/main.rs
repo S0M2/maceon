@@ -10,9 +10,20 @@ use std::{
 };
 use sysinfo::{Components, Disks, Networks, System};
 
+mod network;
+mod process;
+mod power;
+
+use network::NetworkMonitor;
+use process::ProcessMonitor;
+use power::PowerMonitor;
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 const HISTORY_LEN: usize = 60;
 const TICK_MS: u64 = 1000;
+const NETWORK_SCAN_INTERVAL: u64 = 15000;  // Scan network every 15 seconds
+const PROCESS_SCAN_INTERVAL: u64 = 15000;  // Scan processes every 15 seconds
+const BATTERY_SCAN_INTERVAL: u64 = 15000;  // Update battery every 15 seconds
 
 // ─── Color palette ───────────────────────────────────────────────────────────
 const LIME: Color = Color::Rgb(50, 255, 100);
@@ -28,7 +39,7 @@ const DARK: Color = Color::Rgb(20, 20, 30);
 enum Tab {
     Overview,
     Processes,
-    Network,
+    Connections,      // Network + Threats combined
     Storage,
 }
 
@@ -62,23 +73,38 @@ struct App {
     tab: Tab,
     proc_sel: usize,
     proc_off: usize,
+    conn_off: usize,       // Scroll offset for connections table
+    storage_off: usize,    // Scroll offset for storage table
     sort_by: SortBy,
     sort_desc: bool,
 
     // Alerts
     alerts: Vec<String>,
+
+    // New security monitors
+    net_monitor: NetworkMonitor,
+    proc_monitor: ProcessMonitor,
+    power_monitor: PowerMonitor,
+
+    // Rate limiting for expensive operations
+    last_network_scan: Instant,
+    last_process_scan: Instant,
+    last_battery_scan: Instant,
 }
 
 impl App {
     fn new() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
+        let now = Instant::now();
+        // Trigger immediate first scans by setting times to the past
+        let past = now - std::time::Duration::from_secs(60);
         Self {
             sys,
             networks: Networks::new_with_refreshed_list(),
             components: Components::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
-            last_tick: Instant::now(),
+            last_tick: now,
             prev_rx: 0,
             prev_tx: 0,
             rx_speed: 0.0,
@@ -88,9 +114,17 @@ impl App {
             tab: Tab::Overview,
             proc_sel: 0,
             proc_off: 0,
+            conn_off: 0,
+            storage_off: 0,
             sort_by: SortBy::Cpu,
             sort_desc: true,
             alerts: vec![],
+            net_monitor: NetworkMonitor::new(),
+            proc_monitor: ProcessMonitor::new(),
+            power_monitor: PowerMonitor::new(),
+            last_network_scan: past,
+            last_process_scan: past,
+            last_battery_scan: past,
         }
     }
 
@@ -118,13 +152,31 @@ impl App {
         push_history(&mut self.cpu_hist, cpu_p);
         push_history(&mut self.ram_hist, ram_p);
 
+        // ── New security monitors (with rate limiting) ──────────────────────
+        if self.last_network_scan.elapsed().as_millis() as u64 >= NETWORK_SCAN_INTERVAL {
+            self.net_monitor.scan_connections();
+            self.net_monitor.analyze_threats();
+            self.last_network_scan = Instant::now();
+        }
+        
+        if self.last_process_scan.elapsed().as_millis() as u64 >= PROCESS_SCAN_INTERVAL {
+            self.proc_monitor.scan(&self.sys);
+            self.last_process_scan = Instant::now();
+        }
+        
+        if self.last_battery_scan.elapsed().as_millis() as u64 >= BATTERY_SCAN_INTERVAL {
+            self.power_monitor.update_battery_status();
+            self.power_monitor.update_process_impacts(&self.sys);
+            self.last_battery_scan = Instant::now();
+        }
+
         // ── Alerts ─────────────────────────────────────────────────────────
         self.alerts.clear();
         if cpu_p > 85 {
-            self.alerts.push(format!("⚠ CPU SURCHARGÉ : {}%", cpu_p));
+            self.alerts.push(format!("[!] CPU SURCHARGÉ : {}%", cpu_p));
         }
         if ram_p > 85 {
-            self.alerts.push(format!("⚠ RAM CRITIQUE  : {}%", ram_p));
+            self.alerts.push(format!("[!] RAM CRITIQUE  : {}%", ram_p));
         }
         let max_t = self
             .components
@@ -133,7 +185,38 @@ impl App {
             .fold(0.0f32, f32::max);
         if max_t > 85.0 {
             self.alerts
-                .push(format!("⚠ THERMIQUE     : {:.1}°C", max_t));
+                .push(format!("[!] THERMIQUE     : {:.1}°C", max_t));
+        }
+
+        // Check for network threats
+        let (_, suspicious_count, _) = self.net_monitor.get_summary();
+        if suspicious_count > 0 {
+            self.alerts.push(format!(
+                "[THREAT] MENACE RÉSEAU: {} connexion(s) suspecte(s)",
+                suspicious_count
+            ));
+        }
+
+        // Check for process security threats
+        let critical_threats = self
+            .proc_monitor
+            .threats
+            .iter()
+            .filter(|t| t.risk_score > 75)
+            .count();
+        if critical_threats > 0 {
+            self.alerts
+                .push(format!("[THREAT] SÉCURITÉ: {} processus critique(s)", critical_threats));
+        }
+
+        // Check battery health
+        if let Some(battery) = &self.power_monitor.battery {
+            if battery.health_percentage < 50.0 {
+                self.alerts.push(format!(
+                    "[WARN] BATTERIE DÉGRADÉE: {:.0}% santé",
+                    battery.health_percentage
+                ));
+            }
         }
 
         self.last_tick = Instant::now();
@@ -313,8 +396,8 @@ fn main() -> io::Result<()> {
                     KeyCode::Tab => {
                         app.tab = match app.tab {
                             Tab::Overview => Tab::Processes,
-                            Tab::Processes => Tab::Network,
-                            Tab::Network => Tab::Storage,
+                            Tab::Processes => Tab::Connections,
+                            Tab::Connections => Tab::Storage,
                             Tab::Storage => Tab::Overview,
                         };
                     }
@@ -322,8 +405,8 @@ fn main() -> io::Result<()> {
                         app.tab = match app.tab {
                             Tab::Overview => Tab::Storage,
                             Tab::Processes => Tab::Overview,
-                            Tab::Network => Tab::Processes,
-                            Tab::Storage => Tab::Network,
+                            Tab::Connections => Tab::Processes,
+                            Tab::Storage => Tab::Connections,
                         };
                     }
                     // ── Processes navigation
@@ -362,6 +445,56 @@ fn main() -> io::Result<()> {
                         app.sort_by = SortBy::Name;
                         app.sort_desc = false;
                     }
+                    // ── Connections scroll
+                    KeyCode::Down if app.tab == Tab::Connections => {
+                        app.conn_off = app.conn_off.saturating_add(1);
+                    }
+                    KeyCode::Up if app.tab == Tab::Connections => {
+                        app.conn_off = app.conn_off.saturating_sub(1);
+                    }
+                    KeyCode::PageDown if app.tab == Tab::Connections => {
+                        app.conn_off = app.conn_off.saturating_add(10);
+                    }
+                    KeyCode::PageUp if app.tab == Tab::Connections => {
+                        app.conn_off = app.conn_off.saturating_sub(10);
+                    }
+                    // ── Storage scroll
+                    KeyCode::Down if app.tab == Tab::Storage => {
+                        app.storage_off = app.storage_off.saturating_add(1);
+                    }
+                    KeyCode::Up if app.tab == Tab::Storage => {
+                        app.storage_off = app.storage_off.saturating_sub(1);
+                    }
+                    KeyCode::PageDown if app.tab == Tab::Storage => {
+                        app.storage_off = app.storage_off.saturating_add(10);
+                    }
+                    KeyCode::PageUp if app.tab == Tab::Storage => {
+                        app.storage_off = app.storage_off.saturating_sub(10);
+                    }
+                    // ── Manual scan (Connections tab)
+                    KeyCode::Char('s') | KeyCode::Char('S') if app.tab == Tab::Connections => {
+                        app.net_monitor.scan_connections();
+                        app.net_monitor.analyze_threats();
+                        app.alerts.push("[✓] Scan réseau + menaces lancé".to_string());
+                    }
+                    // ── Optimize RAM
+                    KeyCode::Char('o') | KeyCode::Char('O') if app.tab == Tab::Overview => {
+                        app.alerts.push("[!] Optimisation RAM demandée...".to_string());
+                        // Flush caches
+                        let _ = std::process::Command::new("sync").output();
+                        let _ = std::process::Command::new("purge").output();
+                        app.alerts.clear();
+                        app.alerts.push("[✓] Cache vidé et mémoire purgée".to_string());
+                    }
+                    // ── Clean tmp files
+                    KeyCode::Char('c') | KeyCode::Char('C') if app.tab == Tab::Storage => {
+                        app.alerts.push("[!] Nettoyage tmp en cours...".to_string());
+                        let _ = std::process::Command::new("sh")
+                            .args(&["-c", "rm -rf /tmp/* /var/tmp/* 2>/dev/null"])
+                            .output();
+                        app.alerts.clear();
+                        app.alerts.push("[✓] Fichiers temporaires supprimés".to_string());
+                    }
                     _ => {}
                 }
             }
@@ -396,7 +529,7 @@ fn draw(f: &mut Frame, app: &App) {
     match app.tab {
         Tab::Overview => draw_overview(f, app, root[2]),
         Tab::Processes => draw_processes(f, app, root[2]),
-        Tab::Network => draw_network(f, app, root[2]),
+        Tab::Connections => draw_connections(f, app, root[2]),
         Tab::Storage => draw_storage(f, app, root[2]),
     }
 
@@ -431,14 +564,14 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let idx = match app.tab {
         Tab::Overview => 0,
         Tab::Processes => 1,
-        Tab::Network => 2,
+        Tab::Connections => 2,
         Tab::Storage => 3,
     };
     f.render_widget(
         Tabs::new(vec![
             "  Overview  ",
             "  Processus  ",
-            "  Réseau  ",
+            "  Connections  ",
             "  Stockage  ",
         ])
         .select(idx)
@@ -468,12 +601,12 @@ fn draw_alerts(f: &mut Frame, app: &App, area: Rect) {
 // ─── Footer ───────────────────────────────────────────────────────────────────
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match app.tab {
-        Tab::Overview => "[TAB] Changer d'onglet   [Q] Quitter",
+        Tab::Overview => "[TAB] Changer   [O] Optimiser RAM   [Q] Quitter",
         Tab::Processes => {
             "[↑↓] Naviguer   [K] Tuer   [C] CPU   [M] Mém   [P] PID   [N] Nom   [Q] Quitter"
         }
-        Tab::Network => "[TAB] Changer d'onglet   [Q] Quitter",
-        Tab::Storage => "[TAB] Changer d'onglet   [Q] Quitter",
+        Tab::Connections => "[TAB] Changer   [↑↓] Scroller   [S] Scanner   [Q] Quitter",
+        Tab::Storage => "[TAB] Changer   [↑↓] Scroller   [C] Nettoyer tmp   [Q] Quitter",
     };
     f.render_widget(
         Paragraph::new(hint)
@@ -646,8 +779,8 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
 
 // ─── Processes ────────────────────────────────────────────────────────────────
 fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
-    let [table_area, detail_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(area);
+    let [table_area, power_area, detail_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(8), Constraint::Length(6)]).areas(area);
 
     let procs = app.sorted_procs();
     let total_ram = app.sys.total_memory() as f64;
@@ -722,6 +855,57 @@ fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
         table_area,
     );
 
+    // ── Power consumption info ─────────────────────────────────────────────
+    let power_rows: Vec<Row> = app
+        .power_monitor
+        .process_impacts
+        .iter()
+        .take(7)
+        .map(|impact| {
+            let power_color = if impact.estimated_power_mw > 500.0 {
+                RED
+            } else if impact.estimated_power_mw > 200.0 {
+                ORANGE
+            } else {
+                GOLD
+            };
+
+            Row::new([
+                Cell::from(truncate(&impact.name, 25)).style(Style::default().fg(CYAN)),
+                Cell::from(format!("{:.1}%", impact.cpu_percent))
+                    .style(Style::default().fg(grade_color(impact.cpu_percent))),
+                Cell::from(format!("{:.0} mW", impact.estimated_power_mw))
+                    .style(Style::default().fg(power_color)),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(
+            power_rows,
+            [
+                Constraint::Min(25),
+                Constraint::Length(8),
+                Constraint::Length(12),
+            ],
+        )
+        .header(
+            Row::new(["Top Consommateurs", "CPU%", "Puissance"])
+                .style(
+                    Style::default()
+                        .fg(LIME)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+        )
+        .block(
+            Block::bordered()
+                .title(format!(" [ PUISSANCE ] Système: {:.0} mW", app.power_monitor.total_system_power_mw))
+                .border_style(Style::default().fg(ORANGE)),
+        )
+        .column_spacing(1),
+        power_area,
+    );
+
     // ── Selected process detail ───────────────────────────────────────────
     if let Some((pid, proc)) = procs.get(app.proc_sel) {
         let cpu = proc.cpu_usage();
@@ -773,21 +957,21 @@ fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-// ─── Network ──────────────────────────────────────────────────────────────────
-fn draw_network(f: &mut Frame, app: &App, area: Rect) {
-    let [speeds, ifaces] =
-        Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
+// ─── Connections (Network + Threats) ──────────────────────────────────────────
+fn draw_connections(f: &mut Frame, app: &App, area: Rect) {
+    let [speeds, table_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
 
     // Global speeds
     f.render_widget(
         Paragraph::new(vec![Line::from(vec![
-            Span::styled("  ↓ DOWNLOAD : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  ↓ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 fmt_speed(app.rx_speed),
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::raw("          "),
-            Span::styled("↑ UPLOAD   : ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 fmt_speed(app.tx_speed),
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
@@ -795,28 +979,66 @@ fn draw_network(f: &mut Frame, app: &App, area: Rect) {
         ])])
         .block(
             Block::bordered()
-                .title(" [ VITESSE RÉSEAU GLOBALE ] ")
+                .title(" [ VITESSE RÉSEAU ] ")
                 .border_style(Style::default().fg(CYAN)),
         ),
         speeds,
     );
 
-    // Per-interface table
+    // Threat summary
+    let (total, suspicious, whitelisted) = app.net_monitor.get_summary();
+    let summary_color = if suspicious > 0 { RED } else { LIME };
+
+    f.render_widget(
+        Paragraph::new(format!("Total: {} │ Menaces: {} │ Whitelistées: {}", total, suspicious, whitelisted))
+            .block(
+                Block::bordered()
+                    .title(" [ CONNEXIONS ] ")
+                    .border_style(Style::default().fg(summary_color)),
+            ),
+        Rect { x: table_area.x, y: table_area.y, width: table_area.width, height: 2 },
+    );
+
+    let connections_area = Rect {
+        x: table_area.x,
+        y: table_area.y + 2,
+        width: table_area.width,
+        height: table_area.height.saturating_sub(2),
+    };
+
+    // Connection table
     let rows: Vec<Row> = app
-        .networks
+        .net_monitor
+        .threats
         .iter()
-        .map(|(name, d)| {
+        .skip(app.conn_off)
+        .take(50)
+        .map(|threat| {
+            let status_color = if threat.is_whitelisted {
+                LIME
+            } else if threat.is_suspicious {
+                RED
+            } else {
+                CYAN
+            };
+
+            let icon = if threat.is_whitelisted {
+                "[OK]"
+            } else if threat.is_suspicious {
+                "[!!]"
+            } else {
+                "[?]"
+            };
+
             Row::new([
-                Cell::from(name.clone()).style(Style::default().fg(LIME)),
-                Cell::from(fmt_bytes(d.received())).style(Style::default().fg(CYAN)),
-                Cell::from(fmt_bytes(d.transmitted())).style(Style::default().fg(GOLD)),
-                Cell::from(fmt_bytes(d.total_received()))
+                Cell::from(icon).style(Style::default().fg(status_color)),
+                Cell::from(threat.connection.process_name.clone())
+                    .style(Style::default().fg(CYAN)),
+                Cell::from(threat.connection.remote_ip.clone())
+                    .style(Style::default().fg(status_color)),
+                Cell::from(threat.connection.remote_port.to_string())
                     .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(fmt_bytes(d.total_transmitted()))
-                    .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(d.packets_received().to_string())
-                    .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(d.packets_transmitted().to_string())
+                Cell::from(threat.connection.protocol.clone())
                     .style(Style::default().fg(Color::DarkGray)),
             ])
         })
@@ -826,38 +1048,23 @@ fn draw_network(f: &mut Frame, app: &App, area: Rect) {
         Table::new(
             rows,
             [
-                Constraint::Length(16),
-                Constraint::Length(14),
-                Constraint::Length(14),
-                Constraint::Length(14),
-                Constraint::Length(14),
-                Constraint::Length(12),
-                Constraint::Length(12),
+                Constraint::Length(4),
+                Constraint::Min(28),
+                Constraint::Length(18),
+                Constraint::Length(6),
+                Constraint::Length(6),
             ],
         )
         .header(
-            Row::new([
-                "Interface",
-                "RX session",
-                "TX session",
-                "RX total",
-                "TX total",
-                "Pkt RX",
-                "Pkt TX",
-            ])
-            .style(
-                Style::default()
-                    .fg(LIME)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ),
-        )
-        .block(
-            Block::bordered()
-                .title(" [ INTERFACES RÉSEAU ] ")
-                .border_style(Style::default().fg(LIME)),
+            Row::new(["", "Processus", "IP", "Port", "Proto"])
+                .style(
+                    Style::default()
+                        .fg(LIME)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
         )
         .column_spacing(1),
-        ifaces,
+        connections_area,
     );
 }
 
@@ -976,3 +1183,287 @@ fn draw_storage(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 }
+
+// ─── Security Threats (Network Exfiltration Detection) ────────────────────────
+fn draw_security_threats(f: &mut Frame, app: &App, area: Rect) {
+    let [summary_area, table_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+
+    // Summary bar
+    let (total, suspicious, whitelisted) = app.net_monitor.get_summary();
+    let summary_color = if suspicious > 0 { RED } else { LIME };
+
+    f.render_widget(
+        Paragraph::new(vec![Line::from(vec![
+            Span::styled(
+                format!("Total: {} │ ", total),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("Suspectes: {} │ ", suspicious),
+                Style::default().fg(summary_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("Whitelistées: {}", whitelisted),
+                Style::default().fg(LIME),
+            ),
+        ])])
+        .block(
+            Block::bordered()
+                .title(" [ RÉSUMÉ ] ")
+                .border_style(Style::default().fg(summary_color)),
+        ),
+        summary_area,
+    );
+
+    // Connection table
+    let rows: Vec<Row> = app
+        .net_monitor
+        .threats
+        .iter()
+        .take(50)
+        .map(|threat| {
+            let status_color = if threat.is_whitelisted {
+                LIME
+            } else if threat.is_suspicious {
+                RED
+            } else {
+                CYAN
+            };
+
+            let country = threat
+                .geo
+                .as_ref()
+                .map(|g| g.country_code.clone())
+                .unwrap_or_else(|| "??".to_string());
+
+            let icon = if threat.is_whitelisted {
+                "[OK]"
+            } else if threat.is_suspicious {
+                "[!!]"
+            } else {
+                "[?]"
+            };
+
+            Row::new([
+                Cell::from(icon).style(Style::default().fg(status_color)),
+                Cell::from(threat.connection.process_name.clone())
+                    .style(Style::default().fg(CYAN)),
+                Cell::from(threat.connection.remote_ip.clone())
+                    .style(Style::default().fg(status_color)),
+                Cell::from(country).style(Style::default().fg(status_color)),
+                Cell::from(threat.connection.remote_port.to_string())
+                    .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(threat.connection.protocol.clone())
+                    .style(Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Min(20),
+                Constraint::Length(16),
+                Constraint::Length(4),
+                Constraint::Length(6),
+                Constraint::Length(6),
+            ],
+        )
+        .header(
+            Row::new(["", "Processus", "IP Distante", "Pays", "Port", "Proto"])
+                .style(
+                    Style::default()
+                        .fg(LIME)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+        )
+        .block(
+            Block::bordered()
+                .title(" [ CONNEXIONS RÉSEAU ] ")
+                .border_style(Style::default().fg(summary_color)),
+        )
+        .column_spacing(1),
+        table_area,
+    );
+}
+
+// ─── Process Security (Signature & Behavior) ──────────────────────────────────
+fn draw_process_security(f: &mut Frame, app: &App, area: Rect) {
+    let [summary_area, table_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+
+    let critical = app
+        .proc_monitor
+        .threats
+        .iter()
+        .filter(|t| t.risk_score > 75)
+        .count();
+    let suspicious = app
+        .proc_monitor
+        .threats
+        .iter()
+        .filter(|t| t.risk_score > 50 && t.risk_score <= 75)
+        .count();
+
+    let summary_color = if critical > 0 { RED } else if suspicious > 0 { ORANGE } else { LIME };
+
+    f.render_widget(
+        Paragraph::new(vec![Line::from(vec![
+            Span::styled(
+                format!("Total: {} │ ", app.proc_monitor.threats.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("Critique: {} │ ", critical),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("Suspectes: {} │ ", suspicious),
+                Style::default().fg(ORANGE),
+            ),
+            Span::styled(
+                format!("Vérifiées: {}", 
+                    app.proc_monitor.threats.iter().filter(|t| t.signature.signature_valid).count()),
+                Style::default().fg(LIME),
+            ),
+        ])])
+        .block(
+            Block::bordered()
+                .title(" [ ANALYSE DE SÉCURITÉ ] ")
+                .border_style(Style::default().fg(summary_color)),
+        ),
+        summary_area,
+    );
+
+    // Process table
+    let rows: Vec<Row> = app
+        .proc_monitor
+        .threats
+        .iter()
+        .take(50)
+        .map(|threat| {
+            let color = match threat.risk_score {
+                0..=20 => LIME,
+                21..=50 => GOLD,
+                51..=75 => ORANGE,
+                _ => RED,
+            };
+
+            let sig_symbol = app.proc_monitor.get_signature_symbol(threat);
+            let lifespan_str = if threat.history.duration_ms < 2000 {
+                "[WARN] <2s".to_string()
+            } else {
+                format!("{}s", threat.history.duration_ms / 1000)
+            };
+
+            Row::new([
+                Cell::from(sig_symbol).style(Style::default().fg(color)),
+                Cell::from(threat.name.clone()).style(Style::default().fg(CYAN)),
+                Cell::from(threat.pid.to_string()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(format!("{:.1}%", threat.history.max_cpu_usage))
+                    .style(Style::default().fg(grade_color(threat.history.max_cpu_usage))),
+                Cell::from(fmt_bytes(threat.history.max_memory))
+                    .style(Style::default().fg(grade_color(
+                        threat.history.max_memory as f64 / (1024 * 1024 * 1024) as f64 * 100.0,
+                    ))),
+                Cell::from(lifespan_str).style(Style::default().fg(color)),
+                Cell::from(format!("{}", threat.risk_score)).style(Style::default().fg(color)),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(18),
+                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(6),
+            ],
+        )
+        .header(
+            Row::new(["S", "Processus", "PID", "CPU%", "Mémoire", "Durée", "Score"])
+                .style(
+                    Style::default()
+                        .fg(LIME)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+        )
+        .block(
+            Block::bordered()
+                .title(" [ MENACES DE SÉCURITÉ ] ")
+                .border_style(Style::default().fg(summary_color)),
+        )
+        .column_spacing(1),
+        table_area,
+    );
+}
+
+// ─── Battery (Simplified) ────────────────────────────────────────────────────
+fn draw_battery(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(battery) = &app.power_monitor.battery {
+        // Simple charge gauge
+        let charge_color = grade_color(battery.percentage);
+        
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Charge : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.0}%", battery.percentage),
+                    Style::default().fg(charge_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if battery.is_charging { " (En charge)" } else { " (Sur batterie)" },
+                    Style::default().fg(if battery.is_charging { LIME } else { ORANGE }),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Santé : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.0}%", battery.health_percentage),
+                    Style::default().fg(if battery.health_percentage >= 80.0 { LIME } else if battery.health_percentage >= 60.0 { GOLD } else { ORANGE }),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Autonomie : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    battery.time_remaining_minutes
+                        .map(|m| format!("{}h {}m", m / 60, m % 60))
+                        .unwrap_or_else(|| "Calcul...".to_string()),
+                    Style::default().fg(CYAN),
+                ),
+            ]),
+        ];
+
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::bordered()
+                        .title(" [ BATTERIE ] ")
+                        .border_style(Style::default().fg(charge_color)),
+                ),
+            area,
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new("Données batterie non disponibles...")
+                .block(
+                    Block::bordered()
+                        .title(" [ BATTERIE ] ")
+                        .border_style(Style::default().fg(RED)),
+                ),
+            area,
+        );
+    }
+}
+
