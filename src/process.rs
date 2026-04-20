@@ -37,14 +37,6 @@ pub struct ProcessHistory {
 
 #[derive(Debug, Clone)]
 pub struct ProcessThreat {
-    #[allow(dead_code)]
-    pub pid: Pid,
-    #[allow(dead_code)]
-    pub name: String,
-    #[allow(dead_code)]
-    pub signature: ProcessSignature,
-    #[allow(dead_code)]
-    pub history: ProcessHistory,
     pub is_suspicious: bool,
     pub risk_score: u8, // 0-100
 }
@@ -142,10 +134,6 @@ impl ProcessMonitor {
             let is_suspicious = risk_score > 50;
 
             self.threats.push(ProcessThreat {
-                pid: *pid,
-                name,
-                signature,
-                history: history_clone,
                 is_suspicious,
                 risk_score,
             });
@@ -244,29 +232,6 @@ impl ProcessMonitor {
         // Most legitimate processes will have score 0
 
         score
-    }
-
-    /// Get signature status for UI display
-    #[allow(dead_code)]
-    pub fn get_signature_symbol(&self, process: &ProcessThreat) -> &'static str {
-        if process.signature.signature_valid {
-            "[OK]"  // Valid signature
-        } else if process.signature.is_apple_signed {
-            "[~]"  // Partially verified
-        } else {
-            "[?]"  // Unknown
-        }
-    }
-
-    /// Get risk level text
-    #[allow(dead_code)]
-    pub fn get_risk_level(risk_score: u8) -> &'static str {
-        match risk_score {
-            0..=20 => "[OK] Safe",
-            21..=50 => "[!] Caution",
-            51..=75 => "[!!] Suspicious",
-            _ => "[CRITICAL]",
-        }
     }
 
     fn get_current_timestamp() -> u64 {

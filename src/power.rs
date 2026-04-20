@@ -106,14 +106,6 @@ impl PowerMonitor {
         (100.0, 0, 5000, 5000)  // health%, cycles, max_cap, cur_cap (dummy values)
     }
 
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    fn extract_number(&self, line: &str) -> Option<u32> {
-        line.split('=')
-            .last()
-            .and_then(|s| s.trim().parse().ok())
-    }
-
     /// Calculate power impact of processes
     pub fn update_process_impacts(&mut self, sys: &System) {
         self.process_impacts.clear();
